@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # Should be bcrypt hashed password
     ADMIN_PASSWORD_HASH: str = ""
     
+    # JWT Configuration
+    # SECRET_KEY should be a long random string (e.g., generated with: openssl rand -hex 32)
+    # IMPORTANT: Keep this secret and use a strong, unique value in production
+    JWT_SECRET_KEY: str = "your-secret-key-change-this-in-production-use-openssl-rand-hex-32"
+    
     class Config:
         env_file = ".env"
         case_sensitive = True

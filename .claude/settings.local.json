@@ -4,7 +4,8 @@
       "Bash(find:*)",
       "Bash(ls:*)",
       "Bash(head:*)",
-      "Bash(python -m py_compile:*)"
+      "Bash(python -m py_compile:*)",
+      "Bash(uv pip compile:*)"
     ]
   }
 }

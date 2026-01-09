@@ -1,12 +1,14 @@
-"""
-CMS API routes with password authentication.
-All endpoints require password authentication via header.
+c"""
+CMS API routes with JWT token authentication.
+All endpoints require JWT authentication via Authorization header.
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Header, UploadFile, File, Form, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
 from sqlalchemy.sql import func
 from typing import Optional, List
+from pydantic import BaseModel
+from datetime import timedelta
 import logging
 import re
 import asyncio
@@ -14,50 +16,203 @@ import asyncio
 from app.database import get_db
 from app.models import GalleryImage
 from app.schemas import GalleryImageResponse, GalleryImageUpdate, BulkDeleteRequest, ImageReorderRequest
-from app.utils.auth import verify_admin_password
+from app.utils.jwt_auth import verify_cms_token, authenticate_user, create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.utils.image_converter import convert_to_webp
 from app.services.cloudinary_service import upload_image, delete_image
+from app.utils.rate_limit import limiter, RATE_LIMITS
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/cms", tags=["CMS"])
 
 
-def verify_cms_password(
-    x_cms_password: Optional[str] = Header(None, alias="X-CMS-Password", description="CMS admin password")
-) -> bool:
+# =====================
+# REQUEST/RESPONSE MODELS
+# =====================
+
+class LoginRequest(BaseModel):
+    """Login request with password"""
+    password: str
+
+
+class LoginResponse(BaseModel):
+    """Login response with JWT token"""
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int  # seconds
+
+
+# =====================
+# AUTHENTICATION ENDPOINT
+# =====================
+
+@router.post("/login", response_model=LoginResponse)
+@limiter.limit(RATE_LIMITS["login"])
+async def login(request: Request, login_data: LoginRequest):
     """
-    FastAPI dependency for CMS password authentication.
+    Authenticate with password and receive JWT token.
+    Token is stored in httpOnly cookie for security (NFR-S3, FR55).
+    Rate limited to prevent brute force attacks (5 attempts per minute per IP).
     
     Args:
-        x_cms_password: Password provided in request header (X-CMS-Password)
+        request: FastAPI request object (used for rate limiting)
+        login_data: Login credentials (password)
     
     Returns:
-        True if authenticated
+        LoginResponse: JWT token and metadata (token also set in httpOnly cookie)
     
     Raises:
-        HTTPException: 401 if password is invalid or missing
+        HTTPException: 401 if credentials are invalid, 429 if rate limit exceeded
     """
-    if not x_cms_password:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "Missing password", "message": "CMS access requires password authentication"}
-        )
+    from fastapi.responses import JSONResponse
     
     try:
-        if not verify_admin_password(x_cms_password):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={"error": "Invalid password", "message": "CMS access denied"}
-            )
-    except ValueError as e:
-        # ADMIN_PASSWORD_HASH not configured
+        # Authenticate user (will raise 401 if invalid)
+        token_data = authenticate_user(login_data.password)
+        
+        # Create access token
+        access_token = create_access_token(
+            data=token_data,
+            expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        )
+        
+        logger.info("CMS login successful")
+        
+        # Create response with token in JSON body (for compatibility)
+        response_data = LoginResponse(
+            access_token=access_token,
+            token_type="bearer",
+            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60  # Convert to seconds
+        )
+        
+        # Set httpOnly cookie with token (NFR-S3, FR55)
+        # Cookie expires in 8 hours of inactivity (NFR-S1: 480 minutes = 8 hours)
+        # Note: Story says 8 hours of inactivity, but token expires in ACCESS_TOKEN_EXPIRE_MINUTES
+        # Using ACCESS_TOKEN_EXPIRE_MINUTES * 60 for cookie max_age (seconds)
+        cookie_max_age = ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        
+        response = JSONResponse(content=response_data.model_dump())
+        response.set_cookie(
+            key="cms_token",
+            value=access_token,
+            max_age=cookie_max_age,
+            httponly=True,  # Prevent XSS attacks (NFR-S3)
+            secure=True,  # Only sent over HTTPS in production
+            samesite="lax",  # CSRF protection while allowing same-site navigation
+            path="/"  # Available for all paths
+        )
+        
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"error": "Authentication not configured", "message": str(e)}
+            detail={"error": "Login failed", "message": str(e)}
         )
+
+
+# =====================
+# TOKEN REFRESH ENDPOINT
+# =====================
+
+@router.post("/refresh")
+async def refresh_token(request: Request, token_data: dict = Depends(verify_cms_token)):
+    """
+    Refresh JWT token if < 1 hour remaining (NFR-S2).
+    Reads token from httpOnly cookie and refreshes if needed.
     
-    return True
+    Args:
+        request: FastAPI request object (for reading cookies)
+        token_data: Decoded token payload from verify_cms_token dependency
+    
+    Returns:
+        LoginResponse: New or current JWT token and metadata
+    """
+    from fastapi.responses import JSONResponse
+    from datetime import datetime, timezone, timedelta
+    
+    try:
+        # Get current token from cookie
+        current_token = request.cookies.get("cms_token")
+        if not current_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"error": "Missing token", "message": "Authentication required"}
+            )
+        
+        # Check token expiration time
+        exp = token_data.get("exp")
+        if not exp:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"error": "Invalid token", "message": "Token missing expiration"}
+            )
+        
+        exp_datetime = datetime.fromtimestamp(exp, tz=timezone.utc)
+        now = datetime.now(timezone.utc)
+        time_until_expiry = exp_datetime - now
+        
+        # Refresh if < 1 hour remaining (NFR-S2)
+        # Convert to minutes for comparison
+        minutes_until_expiry = time_until_expiry.total_seconds() / 60
+        
+        if minutes_until_expiry < 60:  # < 1 hour remaining
+            # Create new token with same role
+            role = token_data.get("role", "admin")
+            new_token_data = {"role": role}
+            
+            new_access_token = create_access_token(
+                data=new_token_data,
+                expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            )
+            
+            logger.info("Token refreshed (was expiring in < 1 hour)")
+            
+            response_data = LoginResponse(
+                access_token=new_access_token,
+                token_type="bearer",
+                expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60
+            )
+            
+            # Set new token in httpOnly cookie
+            cookie_max_age = ACCESS_TOKEN_EXPIRE_MINUTES * 60
+            response = JSONResponse(content=response_data.model_dump())
+            response.set_cookie(
+                key="cms_token",
+                value=new_access_token,
+                max_age=cookie_max_age,
+                httponly=True,
+                secure=True,
+                samesite="lax",
+                path="/"
+            )
+            
+            return response
+        else:
+            # Token still valid for > 1 hour, no refresh needed
+            logger.debug(f"Token still valid (expires in {minutes_until_expiry:.1f} minutes, no refresh needed)")
+            
+            return LoginResponse(
+                access_token="",  # Not exposed to JS (token in httpOnly cookie)
+                token_type="bearer",
+                expires_in=int(time_until_expiry.total_seconds())
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Token refresh error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "Token refresh failed", "message": str(e)}
+        )
+
+
+# Note: verify_cms_token is now imported from app.utils.jwt_auth
+# It handles JWT token verification via httpOnly cookie (preferred) or Authorization header (fallback)
 
 
 def extract_public_id_from_url(cloudinary_url: str) -> str:
@@ -110,23 +265,23 @@ def extract_public_id_from_url(cloudinary_url: str) -> str:
 @router.get("/gallery-images", response_model=list[GalleryImageResponse])
 async def get_cms_gallery_images(
     db: AsyncSession = Depends(get_db),
-    authenticated: bool = Depends(verify_cms_password)
+    token_data: dict = Depends(verify_cms_token)
 ):
     """
     Get all gallery images for CMS dashboard.
-    Requires password authentication.
+    Requires JWT authentication via Authorization header.
     
-    Returns gallery images ordered by creation date (newest first).
+    Returns gallery images ordered by display_order.
     
     Args:
         db: Database session (injected by FastAPI dependency)
-        authenticated: Authentication status (injected by dependency)
+        token_data: Decoded JWT token data (injected by dependency)
     
     Returns:
         list[GalleryImageResponse]: List of gallery images with metadata
     
     Raises:
-        HTTPException: 500 if database query fails
+        HTTPException: 401 if token invalid, 500 if database query fails
     """
     try:
         # Query all gallery images, ordered by display_order ascending (custom order)
@@ -152,17 +307,17 @@ async def get_cms_gallery_images(
 async def add_cms_gallery_images(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    authenticated: bool = Depends(verify_cms_password)
+    token_data: dict = Depends(verify_cms_token)
 ):
     """
     Add one or more gallery images (single or bulk upload).
-    Requires password authentication.
+    Requires JWT authentication.
     Uploads images to Cloudinary and saves metadata to database.
     
     Args:
         request: FastAPI Request object to parse multipart form data
         db: Database session (injected by FastAPI dependency)
-        authenticated: Authentication status (injected by dependency)
+        token_data: Decoded JWT token data (injected by dependency)
     
     Returns:
         List[GalleryImageResponse]: Created images with metadata
@@ -374,11 +529,11 @@ async def _upload_to_cloudinary(file: UploadFile, caption: Optional[str]) -> dic
 async def reorder_gallery_images(
     request: ImageReorderRequest,
     db: AsyncSession = Depends(get_db),
-    authenticated: bool = Depends(verify_cms_password)
+    token_data: dict = Depends(verify_cms_token)
 ):
     """
     Reorder gallery images by updating display_order.
-    Requires password authentication.
+    Requires JWT authentication.
 
     The frontend sends an array of image IDs in the desired display order.
     This endpoint updates each image's display_order to match the array index.
@@ -386,7 +541,7 @@ async def reorder_gallery_images(
     Args:
         request: ImageReorderRequest containing ordered list of image IDs
         db: Database session (injected by FastAPI dependency)
-        authenticated: Authentication status (injected by dependency)
+        token_data: Decoded JWT token data (injected by dependency)
 
     Returns:
         dict: Success message with count of reordered images
@@ -478,17 +633,17 @@ async def update_cms_gallery_image(
     image_id: int,
     image_update: GalleryImageUpdate,
     db: AsyncSession = Depends(get_db),
-    authenticated: bool = Depends(verify_cms_password)
+    token_data: dict = Depends(verify_cms_token)
 ):
     """
     Update an existing gallery image caption.
-    Requires password authentication.
+    Requires JWT authentication.
     
     Args:
         image_id: Image ID to update
         image_update: Update data containing caption (optional, can be null to clear caption)
         db: Database session (injected by FastAPI dependency)
-        authenticated: Authentication status (injected by dependency)
+        token_data: Decoded JWT token data (injected by dependency)
     
     Returns:
         GalleryImageResponse: Updated image with metadata
@@ -534,17 +689,17 @@ async def update_cms_gallery_image(
 async def delete_cms_gallery_images_bulk(
     request: BulkDeleteRequest,
     db: AsyncSession = Depends(get_db),
-    authenticated: bool = Depends(verify_cms_password)
+    token_data: dict = Depends(verify_cms_token)
 ):
     """
     Delete multiple gallery images at once (bulk delete).
-    Requires password authentication.
+    Requires JWT authentication.
     Deletes from both database and Cloudinary.
     
     Args:
         image_ids: List of image IDs to delete
         db: Database session (injected by FastAPI dependency)
-        authenticated: Authentication status (injected by dependency)
+        token_data: Decoded JWT token data (injected by dependency)
     
     Returns:
         dict: Success message with deleted image IDs and any errors
@@ -676,17 +831,17 @@ async def _delete_from_cloudinary(image: GalleryImage) -> None:
 async def delete_cms_gallery_image(
     image_id: int,
     db: AsyncSession = Depends(get_db),
-    authenticated: bool = Depends(verify_cms_password)
+    token_data: dict = Depends(verify_cms_token)
 ):
     """
     Delete a gallery image.
-    Requires password authentication.
+    Requires JWT authentication.
     Deletes from both database and Cloudinary.
     
     Args:
         image_id: Image ID to delete
         db: Database session (injected by FastAPI dependency)
-        authenticated: Authentication status (injected by dependency)
+        token_data: Decoded JWT token data (injected by dependency)
     
     Returns:
         dict: Success message with image ID

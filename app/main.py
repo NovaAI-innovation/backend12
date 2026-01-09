@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 import logging
 import asyncio
 
@@ -15,6 +17,7 @@ from app.config import settings
 from app.database import get_db, init_db, close_db
 from app.services.cloudinary_service import validate_cloudinary_config
 from app.routes import gallery, cms
+from app.utils.rate_limit import limiter
 
 # Configure logging
 logging.basicConfig(
@@ -29,6 +32,10 @@ app = FastAPI(
     description=settings.API_DESCRIPTION,
     version=settings.API_VERSION,
 )
+
+# Add rate limiting
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS Middleware Configuration
 # Allow ALL origins for now to fix CORS issues
