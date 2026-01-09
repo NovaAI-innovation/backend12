@@ -1,4 +1,4 @@
-c"""
+"""
 CMS API routes with JWT token authentication.
 All endpoints require JWT authentication via Authorization header.
 """
