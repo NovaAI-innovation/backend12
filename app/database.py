@@ -25,20 +25,30 @@ Base = declarative_base()
 # Pool settings only apply to PostgreSQL (not SQLite)
 _engine_args = {
     "echo": False,  # Set to True for SQL query logging in development
+    "pool_timeout": 30,  # Timeout for getting connection from pool (seconds)
+    "connect_args": {
+        "command_timeout": 30,  # Timeout for database commands (seconds)
+    }
 }
 
 # Add PostgreSQL-specific connection pooling if using PostgreSQL
 if settings.DATABASE_URL and settings.DATABASE_URL.startswith("postgresql"):
+    # Merge connect_args instead of replacing
+    postgres_connect_args = _engine_args.get("connect_args", {}).copy()
+    postgres_connect_args.update({
+        "server_settings": {
+            "application_name": "mm-bmad-v2-backend"
+        },
+        "command_timeout": 30,  # Timeout for database commands (seconds)
+    })
+    
     _engine_args.update({
         "pool_size": 10,  # Number of connections to maintain in pool
         "max_overflow": 20,  # Additional connections allowed beyond pool_size
         "pool_pre_ping": True,  # Verify connections before using (handles stale connections)
         "pool_recycle": 3600,  # Recycle connections after 1 hour (prevents stale connections)
-        "connect_args": {
-            "server_settings": {
-                "application_name": "mm-bmad-v2-backend"
-            }
-        }
+        "pool_timeout": 30,  # Timeout for getting connection from pool (seconds)
+        "connect_args": postgres_connect_args
     })
 
 engine = create_async_engine(

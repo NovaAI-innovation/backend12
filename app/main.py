@@ -53,10 +53,16 @@ app.add_middleware(
 # Note: Custom CORS middleware removed as CORSMiddleware with allow_origins=["*"] handles all cases
 
 
-# Request logging middleware for debugging
+# Request timeout configuration (30 seconds)
+REQUEST_TIMEOUT = 30.0
+
+# Request logging and timeout middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """Log incoming requests for debugging, especially OPTIONS requests."""
+    import time
+    from fastapi import HTTPException, status
+    
     method = request.method
     path = request.url.path
     origin = request.headers.get("origin", "No origin header")
@@ -75,9 +81,14 @@ async def log_requests(request: Request, call_next):
     else:
         logger.debug(f"Incoming {method} request to {path} from origin: {origin}")
     
+    start_time = time.time()
     try:
-        response = await call_next(request)
-        logger.info(f"Response status: {response.status_code} for {method} {path}")
+        response = await asyncio.wait_for(
+            call_next(request),
+            timeout=REQUEST_TIMEOUT
+        )
+        elapsed_time = time.time() - start_time
+        logger.info(f"Response status: {response.status_code} for {method} {path} (took {elapsed_time:.2f}s)")
         
         # Log CORS headers in response for OPTIONS
         if method == "OPTIONS":
@@ -88,9 +99,25 @@ async def log_requests(request: Request, call_next):
             logger.info(f"CORS response headers: {cors_headers}")
         
         return response
-    except Exception as e:
+    except asyncio.TimeoutError:
+        elapsed_time = time.time() - start_time
         logger.error(
-            f"Error processing {method} {path}: {str(e)}\n"
+            f"Request timeout after {elapsed_time:.2f}s: {method} {path}\n"
+            f"  Origin: {origin}\n"
+            f"  Timeout limit: {REQUEST_TIMEOUT}s"
+        )
+        response = JSONResponse(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            content={
+                "error": "Request timeout",
+                "detail": f"Request took longer than {REQUEST_TIMEOUT} seconds to process"
+            }
+        )
+        return add_cors_headers(response, request)
+    except Exception as e:
+        elapsed_time = time.time() - start_time
+        logger.error(
+            f"Error processing {method} {path} (took {elapsed_time:.2f}s): {str(e)}\n"
             f"  Origin: {origin}\n"
             f"  Error type: {type(e).__name__}",
             exc_info=True
